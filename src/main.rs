@@ -2,8 +2,8 @@ use bevy::prelude::*;
 use rand::prelude::random;
 
 use std::{
-    net::TcpListener,
-    thread::spawn,
+    net::{TcpListener, TcpStream, IpAddr, Ipv4Addr, SocketAddr},
+    u16,
 };
 
 use tungstenite::{
@@ -11,6 +11,7 @@ use tungstenite::{
     handshake::server::{Request, Response},
     protocol::Message,
     error::Error,
+    WebSocket,
 };
 
 fn main() {
@@ -18,6 +19,8 @@ fn main() {
         .insert_resource(ClearColor(Color::BLACK))
         .add_startup_system(setup.system())
         .add_startup_stage("game_setup", SystemStage::single(spawn_player.system()))
+        .add_system(websocket_handshake.system())
+        .add_system(websocket_server.system())
         .add_system(player_movement.system())
         .add_plugins(DefaultPlugins)
         .run();
@@ -26,8 +29,12 @@ fn main() {
 fn setup(mut commands: Commands) {
     commands.spawn_bundle(OrthographicCameraBundle::new_2d());
     
-    // Start websocket server on separate thread to prevent blocking
-    spawn(|| handshake());
+    const PORT: u16 = 3012;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), PORT);
+    let server = TcpListener::bind(addr).expect("Failed to bind server TcpListener.");
+    server.set_nonblocking(true).expect("Failed to set server TcpListener to nonblocking.");
+    commands.insert_resource(server);
+    commands.insert_resource(Vec::<WebSocket<TcpStream>>::new());
 }
 
 fn spawn_player(
@@ -95,37 +102,52 @@ fn player_movement(
 
 struct Player;
 
-fn handshake() {
-    let server = TcpListener::bind("127.0.0.1:3012").unwrap();
+fn websocket_handshake(
+    server: Res<TcpListener>,
+    mut ws: ResMut<Vec<WebSocket<TcpStream>>>,
+) {
     for stream in server.incoming() {
-        spawn(move || {
-            let callback = |req: &Request, response: Response| {
-                println!("Received a new ws handshake at {}", req.uri());
-                Ok(response)
-            };
-            let mut websocket = accept_hdr(stream.unwrap(), callback).unwrap();
-            
-            websocket.write_message(Message::text("Hello from Rust!")).unwrap();
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
 
-            loop {
-                let msg = match websocket.read_message() {
-                    Err(error) => {
-                        if let Error::ConnectionClosed = error {
-                            println!("Connection closed");
-                            break;
-                        }
-                        panic!("{}", error);
-                    },
-                    Ok(message) => message,
-                };
-                if msg.is_binary() || msg.is_text() {
-                    websocket.write_message(
-                        Message::text(
-                            format!("Your message was {} bytes long!", msg.to_text().unwrap().len())
-                        )
-                    ).unwrap();
+        let mut websocket = accept_hdr(stream, |req: &Request, response: Response| {
+            info!("Received a new ws handshake at {}", req.uri());
+            Ok(response)
+        }).expect("Failed to accept websocket stream.");
+        
+        websocket
+            .write_message(Message::text("Hello from Rust!"))
+            .expect("Failed to write message.");
+        
+        ws.push(websocket);
+    }
+}
+
+fn websocket_server(mut ws: ResMut<Vec<WebSocket<TcpStream>>>) {
+    let mut closed_websockets = Vec::<usize>::new();
+    for (i, websocket) in ws.iter_mut().enumerate() {
+        let msg = match websocket.read_message() {
+            Err(error) => {
+                if let Error::ConnectionClosed = error {
+                    info!("Connection closed");
+                    closed_websockets.push(i);
+                    continue;
                 }
-            }
-        });
+                panic!("{}", error);
+            },
+            Ok(message) => message,
+        };
+        if msg.is_binary() || msg.is_text() {
+            websocket.write_message(
+                Message::text(
+                    format!("Your message was {} bytes long!", msg.to_text().unwrap().len())
+                )
+            ).expect("Failed to write message.");
+        }
+    }
+    for closed_websocket in closed_websockets {
+        ws.remove(closed_websocket);
     }
 }
