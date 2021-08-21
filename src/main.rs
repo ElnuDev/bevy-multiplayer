@@ -1,17 +1,12 @@
-use bevy::prelude::*;
+use bevy::{prelude::*, tasks::IoTaskPool};
 use rand::prelude::random;
-
-use std::{
-    net::{TcpListener, TcpStream, IpAddr, Ipv4Addr, SocketAddr},
-    u16,
-};
-
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use std::net::{TcpListener, IpAddr, Ipv4Addr, SocketAddr};
+use std::thread::spawn;
 use tungstenite::{
     accept_hdr,
     handshake::server::{Request, Response},
     protocol::Message,
-    error::Error,
-    WebSocket,
 };
 
 fn main() {
@@ -19,22 +14,22 @@ fn main() {
         .insert_resource(ClearColor(Color::BLACK))
         .add_startup_system(setup.system())
         .add_startup_stage("game_setup", SystemStage::single(spawn_player.system()))
-        .add_system(websocket_handshake.system())
-        .add_system(websocket_server.system())
+        .add_system(message.system())
         .add_system(player_movement.system())
         .add_plugins(DefaultPlugins)
         .run();
 }
 
-fn setup(mut commands: Commands) {
+fn setup(mut commands: Commands, task_pool: Res<IoTaskPool>) {
     commands.spawn_bundle(OrthographicCameraBundle::new_2d());
-    
-    const PORT: u16 = 3012;
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), PORT);
-    let server = TcpListener::bind(addr).expect("Failed to bind server TcpListener.");
-    server.set_nonblocking(true).expect("Failed to set server TcpListener to nonblocking.");
-    commands.insert_resource(server);
-    commands.insert_resource(Vec::<WebSocket<TcpStream>>::new());
+
+    let (sender, receiver) = unbounded::<String>();
+    let (sender2, receiver2) = unbounded::<String>();
+
+    task_pool.spawn(handshake(sender, receiver2)).detach();
+
+    commands.insert_resource(receiver);
+    commands.insert_resource(sender2);
 }
 
 fn spawn_player(
@@ -102,10 +97,15 @@ fn player_movement(
 
 struct Player;
 
-fn websocket_handshake(
-    server: Res<TcpListener>,
-    mut ws: ResMut<Vec<WebSocket<TcpStream>>>,
-) {
+async fn handshake(sender: Sender<String>, receiver: Receiver<String>) {
+    const PORT: u16 = 3012;
+    let addr = SocketAddr::new(
+        IpAddr::V4(
+            Ipv4Addr::new(127, 0, 0, 1)
+        ),
+        PORT,
+    );
+    let server = TcpListener::bind(addr).expect("Failed to bind server TcpListener.");
     for stream in server.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -121,32 +121,37 @@ fn websocket_handshake(
             .write_message(Message::text("Hello from Rust!"))
             .expect("Failed to write message.");
         
-        ws.push(websocket);
+        let sender = sender.clone();
+        let receiver = receiver.clone();
+
+        spawn(move || loop {
+            let msg = match websocket.read_message() {
+                Err(error) => {
+                    error!("{}", error);
+                    break;
+                },
+                Ok(message) => message,
+            };
+            if msg.is_binary() || msg.is_text() {
+                sender.send(msg.to_text().unwrap().into()).unwrap();
+                if let Ok(response) = receiver.recv() {
+                    websocket
+                        .write_message(Message::text(response))
+                        .expect("Failed to write message");
+                }
+            }
+        });
     }
 }
 
-fn websocket_server(mut ws: ResMut<Vec<WebSocket<TcpStream>>>) {
-    let mut closed_websockets = Vec::<usize>::new();
-    for (i, websocket) in ws.iter_mut().enumerate() {
-        let msg = match websocket.read_message() {
-            Err(error) => {
-                if let Error::ConnectionClosed = error {
-                    info!("Connection closed");
-                    closed_websockets.push(i);
-                }
-                continue;
-            },
-            Ok(message) => message,
-        };
-        if msg.is_binary() || msg.is_text() {
-            websocket.write_message(
-                Message::text(
-                    format!("Your message was {} bytes long!", msg.to_text().unwrap().len())
-                )
-            ).expect("Failed to write message.");
-        }
-    }
-    for closed_websocket in closed_websockets {
-        ws.remove(closed_websocket);
+fn message(
+    sender: Res<Sender<String>>,
+    receiver: Res<Receiver<String>>,
+    players: Query<&Transform, With<Player>>,
+) {
+    if let Ok(_) = receiver.try_recv() {
+        let player = players.iter().next().unwrap();
+        sender.send(format!("{:?}", player.translation))
+            .expect("Failed to send response.");
     }
 }
