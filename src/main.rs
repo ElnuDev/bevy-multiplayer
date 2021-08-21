@@ -133,9 +133,8 @@ fn websocket_server(mut ws: ResMut<Vec<WebSocket<TcpStream>>>) {
                 if let Error::ConnectionClosed = error {
                     info!("Connection closed");
                     closed_websockets.push(i);
-                    continue;
                 }
-                panic!("{}", error);
+                continue;
             },
             Ok(message) => message,
         };
