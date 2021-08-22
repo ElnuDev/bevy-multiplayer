@@ -1,3 +1,4 @@
+use bevy::app::AppExit;
 use bevy::{prelude::*, tasks::IoTaskPool};
 use rand::prelude::random;
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -15,6 +16,7 @@ fn main() {
         .add_startup_system(setup.system())
         .add_startup_stage("game_setup", SystemStage::single(spawn_player.system()))
         .add_system(message.system())
+        .add_system(handle_exit.system())
         .add_system(player_movement.system())
         .add_plugins(DefaultPlugins)
         .run();
@@ -125,6 +127,13 @@ async fn handshake(sender: Sender<String>, receiver: Receiver<String>) {
         let receiver = receiver.clone();
 
         spawn(move || loop {
+            if let Ok(response) = receiver.recv() {
+                info!("{}", response);
+                if response == "exit" {
+                    websocket.close(None).unwrap();
+                    return;
+                }
+            }
             let msg = match websocket.read_message() {
                 Err(error) => {
                     error!("{}", error);
@@ -153,5 +162,15 @@ fn message(
         let player = players.iter().next().unwrap();
         sender.send(format!("{:?}", player.translation))
             .expect("Failed to send response.");
+    }
+}
+
+fn handle_exit(
+    mut exit_reader: EventReader<AppExit>,
+    sender: Res<Sender<String>>,
+) {
+    if exit_reader.iter().next().is_some() {
+        sender.send("exit".to_string())
+            .expect("Failed to send exit message.");
     }
 }
